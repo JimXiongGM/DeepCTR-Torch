@@ -23,9 +23,19 @@ from ..inputs import build_input_features, SparseFeat, DenseFeat, VarLenSparseFe
 from ..layers import PredictionLayer
 from ..layers.utils import slice_arrays
 
+# import dill as pickle
+
+# add
+def topK_acc(y_true, y_pred, K=3):
+    #以下是计算方法
+    max_k_preds = y_pred.argsort(axis=1)[:, -K:][:, ::-1] #得到top-k label
+    match_array = np.logical_or.reduce(max_k_preds == y_true, axis = 1) #得到匹配结果
+    topk_acc_score = match_array.sum() / match_array.shape[0]
+    return topk_acc_score
+
 
 class Linear(nn.Module):
-    def __init__(self, feature_columns, feature_index, init_std=0.0001, device='cpu'):
+    def __init__(self, feature_columns, feature_index, init_std=0.0001, device='cpu', class_num=1):
         super(Linear, self).__init__()
         self.feature_index = feature_index
         self.device = device
@@ -49,9 +59,17 @@ class Linear(nn.Module):
             nn.init.normal_(tensor.weight, mean=0, std=init_std)
 
         if len(self.dense_feature_columns) > 0:
-            self.weight = nn.Parameter(torch.Tensor(sum(fc.dimension for fc in self.dense_feature_columns), 1)).to(
+            print(f"dense_feature_columns is EMPTY!")
+            self.weight = nn.Parameter(torch.Tensor(sum(fc.dimension for fc in self.dense_feature_columns), class_num)).to(
                 device)
             torch.nn.init.normal_(self.weight, mean=0, std=init_std)
+        
+        # 多分类
+        self.class_num = class_num
+        if self.sparse_feature_columns!=[]:
+            self.sparse_to_multiclass = nn.Linear(len(self.sparse_feature_columns), self.class_num, bias=False).to(device)
+            self.dense_to_multiclass = nn.Linear(len(self.dense_feature_columns), self.class_num, bias=False).to(device)
+    
 
     def forward(self, X):
 
@@ -67,21 +85,29 @@ class Linear(nn.Module):
 
         sparse_embedding_list += varlen_embedding_list
 
-        if len(sparse_embedding_list) > 0 and len(dense_value_list) > 0:
-            linear_sparse_logit = torch.sum(
-                torch.cat(sparse_embedding_list, dim=-1), dim=-1, keepdim=False)
-            linear_dense_logit = torch.cat(
-                dense_value_list, dim=-1).matmul(self.weight)
+        # 增加多分类 linear_sparse_logit linear_dense_logit --> [bsz, num_class]
+        if self.class_num>2:
+            linear_sparse_logit = self.sparse_to_multiclass(torch.cat(sparse_embedding_list, dim=-1).squeeze())
+            linear_dense_logit = torch.cat(dense_value_list, dim=-1).matmul(self.weight)
             linear_logit = linear_sparse_logit + linear_dense_logit
-        elif len(sparse_embedding_list) > 0:
-            linear_logit = torch.sum(
-                torch.cat(sparse_embedding_list, dim=-1), dim=-1, keepdim=False)
-        elif len(dense_value_list) > 0:
-            linear_logit = torch.cat(
-                dense_value_list, dim=-1).matmul(self.weight)
+            return linear_logit
+
         else:
-            linear_logit = torch.zeros([X.shape[0], 1])
-        return linear_logit
+            if len(sparse_embedding_list) > 0 and len(dense_value_list) > 0:
+                linear_sparse_logit = torch.sum(
+                    torch.cat(sparse_embedding_list, dim=-1), dim=-1, keepdim=False)
+                linear_dense_logit = torch.cat(
+                    dense_value_list, dim=-1).matmul(self.weight)
+                linear_logit = linear_sparse_logit + linear_dense_logit
+            elif len(sparse_embedding_list) > 0:
+                linear_logit = torch.sum(
+                    torch.cat(sparse_embedding_list, dim=-1), dim=-1, keepdim=False)
+            elif len(dense_value_list) > 0:
+                linear_logit = torch.cat(
+                    dense_value_list, dim=-1).matmul(self.weight)
+            else:
+                linear_logit = torch.zeros([X.shape[0], 1])
+            return linear_logit
 
 
 class BaseModel(nn.Module):
@@ -89,10 +115,11 @@ class BaseModel(nn.Module):
                  linear_feature_columns, dnn_feature_columns, dnn_hidden_units=(128, 128),
                  l2_reg_linear=1e-5,
                  l2_reg_embedding=1e-5, l2_reg_dnn=0, init_std=0.0001, seed=1024, dnn_dropout=0, dnn_activation='relu',
-                 task='binary', device='cpu'):
+                 task='binary', device='cpu', class_num=1):
 
         super(BaseModel, self).__init__()
-        torch.manual_seed(seed)
+
+        self.task = task
         self.dnn_feature_columns = dnn_feature_columns
 
         self.reg_loss = torch.zeros((1,), device=device)
@@ -110,7 +137,7 @@ class BaseModel(nn.Module):
         #         )
 
         self.linear_model = Linear(
-            linear_feature_columns, self.feature_index, device=device)
+            linear_feature_columns, self.feature_index, device=device, class_num=class_num)
 
         self.add_regularization_loss(
             self.embedding_dict.parameters(), l2_reg_embedding)
@@ -129,7 +156,8 @@ class BaseModel(nn.Module):
             validation_split=0.,
             validation_data=None,
             shuffle=True,
-            use_double=False):
+            use_double=False,
+            save_name="model.pt"):
         """
 
         :param x: Numpy array of training data (if the model has a single input), or list of Numpy arrays (if the model has multiple inputs).If input layers in the model are named, you can also pass a
@@ -182,8 +210,7 @@ class BaseModel(nn.Module):
                 x[i] = np.expand_dims(x[i], axis=1)
 
         train_tensor_data = Data.TensorDataset(
-            torch.from_numpy(
-                np.concatenate(x, axis=-1)),
+            torch.from_numpy(np.concatenate(x, axis=-1)),
             torch.from_numpy(y))
         if batch_size is None:
             batch_size = 256
@@ -206,21 +233,30 @@ class BaseModel(nn.Module):
             total_loss_epoch = 0
             # if abs(loss_last - loss_now) < 0.0
             train_result = {}
+            loss_epoch_list = []
+            
             try:
                 with tqdm(enumerate(train_loader), disable=verbose != 1) as t:
                     for index, (x_train, y_train) in t:
                         x = x_train.to(self.device).float()
-                        y = y_train.to(self.device).float()
+                        if self.task == 'binary':
+                            y = y_train.to(self.device).float()
+                        else:
+                            y = y_train.to(self.device).long()
 
                         y_pred = model(x).squeeze()
 
                         optim.zero_grad()
-                        loss = loss_func(y_pred, y.squeeze(), reduction='sum')
+                        if self.task == 'binary':
+                            loss = loss_func(y_pred, y.squeeze(), reduction='sum')
+                        else:
+                            loss = loss_func(y_pred, y.squeeze(), reduction='sum', ignore_index=0)
 
                         total_loss = loss + self.reg_loss + self.aux_loss
 
                         loss_epoch += loss.item()
                         total_loss_epoch += total_loss.item()
+                        
                         total_loss.backward(retain_graph=True)
                         optim.step()
 
@@ -235,6 +271,12 @@ class BaseModel(nn.Module):
                                 else:
                                     train_result[name].append(metric_fun(
                                         y.cpu().data.numpy(), y_pred.cpu().data.numpy()))
+                    
+                loss_epoch_list.append(loss_epoch)        
+                # loss下降 保存模型
+                if len(loss_epoch_list) == 1 or loss_epoch_list[-1] < loss_epoch_list[-2]:
+                    # torch.save(model, save_name)
+                    torch.save(model.state_dict(), save_name)
 
             except KeyboardInterrupt:
                 t.close()
@@ -260,7 +302,7 @@ class BaseModel(nn.Module):
                                     ": {0: .4f}".format(result)
                 print(eval_str)
 
-    def evaluate(self, x, y, batch_size=256):
+    def evaluate(self, x, y, batch_size=256, detail_mode=False):
         """
 
         :param x: Numpy array of test data (if the model has a single input), or list of Numpy arrays (if the model has multiple inputs).
@@ -272,7 +314,8 @@ class BaseModel(nn.Module):
         eval_result = {}
         for name, metric_fun in self.metrics.items():
             eval_result[name] = metric_fun(y, pred_ans)
-        return eval_result
+        if detail_mode: return pred_ans, eval_result
+        else: return eval_result
 
     def predict(self, x, batch_size=256, use_double=False):
         """
@@ -322,8 +365,8 @@ class BaseModel(nn.Module):
                 "DenseFeat is not supported in dnn_feature_columns")
 
         sparse_embedding_list = [embedding_dict[feat.embedding_name](
-            X[:, self.feature_index[feat.name][0]:self.feature_index[feat.name][1]].long()) for
-            feat in sparse_feature_columns]
+            X[:, self.feature_index[feat.name][0]:self.feature_index[feat.name][1]].long()) \
+                for feat in sparse_feature_columns]
 
         varlen_sparse_embedding_list = get_varlen_pooling_list(self.embedding_dict, X, self.feature_index,
                                                                varlen_sparse_feature_columns, self.device)
@@ -405,6 +448,8 @@ class BaseModel(nn.Module):
                 loss_func = F.mse_loss
             elif loss == "mae":
                 loss_func = F.l1_loss
+            elif loss == "cross_entropy":
+                loss_func = F.cross_entropy
             else:
                 raise NotImplementedError
         else:
@@ -433,9 +478,13 @@ class BaseModel(nn.Module):
                     metrics_[metric] = roc_auc_score
                 if metric == "mse":
                     metrics_[metric] = mean_squared_error
-                if metric == "accuracy" or metric == "acc":
-                    metrics_[metric] = lambda y_true, y_pred: accuracy_score(
-                        y_true, np.where(y_pred > 0.5, 1, 0))
+                if metric == "accuracy" or metric == "acc" or metric == "acc top1":
+                    if self.task == 'binary':
+                        metrics_[metric] = lambda y_true, y_pred: accuracy_score(y_true, np.where(y_pred > 0.5, 1, 0))
+                    else:
+                        metrics_[metric] = lambda y_true, y_pred: accuracy_score(y_true, y_pred.argmax(axis=-1))
+                if metric == "acc_top3":
+                    metrics_[metric] = topK_acc
         return metrics_
 
     @property
@@ -448,3 +497,4 @@ class BaseModel(nn.Module):
         if len(embedding_size_set) > 1:
             raise ValueError("embedding_dim of SparseFeat and VarlenSparseFeat must be same in this model!")
         return list(embedding_size_set)[0]
+

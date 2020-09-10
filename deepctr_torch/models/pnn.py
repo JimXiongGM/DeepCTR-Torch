@@ -36,14 +36,14 @@ class PNN(BaseModel):
 
     def __init__(self, dnn_feature_columns, dnn_hidden_units=(128, 128), l2_reg_embedding=1e-5, l2_reg_dnn=0,
                  init_std=0.0001, seed=1024, dnn_dropout=0, dnn_activation='relu', use_inner=True, use_outter=False,
-                 kernel_type='mat', task='binary', device='cpu', ):
+                 kernel_type='mat', task='binary', device='cpu', class_num=1):
 
         super(PNN, self).__init__([], dnn_feature_columns,
                                   dnn_hidden_units=dnn_hidden_units,
                                   l2_reg_embedding=l2_reg_embedding, l2_reg_dnn=l2_reg_dnn,
                                   l2_reg_linear=0, init_std=init_std, seed=seed,
                                   dnn_dropout=dnn_dropout, dnn_activation=dnn_activation,
-                                  task=task, device=device)
+                                  task=task, device=device, class_num=class_num)
 
         if kernel_type not in ['mat', 'vec', 'num']:
             raise ValueError("kernel_type must be mat,vec or num")
@@ -52,6 +52,7 @@ class PNN(BaseModel):
         self.use_outter = use_outter
         self.kernel_type = kernel_type
         self.task = task
+        self.class_num=class_num
 
         product_out_dim = 0
         num_inputs = self.compute_input_dim(dnn_feature_columns, include_dense=False, feature_group=True)
@@ -71,7 +72,7 @@ class PNN(BaseModel):
                        init_std=init_std, device=device)
 
         self.dnn_linear = nn.Linear(
-            dnn_hidden_units[-1], 1, bias=False).to(device)
+            dnn_hidden_units[-1], self.class_num, bias=False).to(device)
         self.add_regularization_loss(
             filter(lambda x: 'weight' in x[0] and 'bn' not in x[0], self.dnn.named_parameters()), l2_reg_dnn)
         self.add_regularization_loss(self.dnn_linear.weight, l2_reg_dnn)
